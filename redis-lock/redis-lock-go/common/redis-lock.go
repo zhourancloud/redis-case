@@ -7,23 +7,35 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/go-redis/redis"
 	"github.com/nacos-group/nacos-sdk-go/inner/uuid"
 )
 
 type RedisLock struct {
-	uid      string
-	redisdb  redis.Client
+	redisdb redis.Client
+
+	uid         string
+	expire_time int
+	// 加锁资源
+	key string
+	// 订阅频道名
+	subscribe_name string
+	// 加锁命令
 	lock_lua string
+	// 释放锁命令
+	unlock_lua string
 }
 
 // 构造函数
-func newRedisLock(redisdb redis.Client) *RedisLock {
+func newRedisLock(redisdb redis.Client, key string, expire int) *RedisLock {
 	return &RedisLock{
-		uid:     uuid.Must(uuid.NewV4()).String(),
-		redisdb: redisdb,
-
+		redisdb:        redisdb,
+		uid:            uuid.Must(uuid.NewV4()).String(),
+		expire_time:    expire,
+		key:            key,
+		subscribe_name: "redisson_lock__channel:" + key,
 		lock_lua: `
 		if (redis.call('exists', KEYS[1]) == 0) then 
 			redis.call('hset', KEYS[1], ARGV[1], 1); 
@@ -36,24 +48,87 @@ func newRedisLock(redisdb redis.Client) *RedisLock {
 			return nil
 		end	
 		return redis.call('pttl', KEYS[1]);`,
+
+		// KEYS[1]=order KEYS[2]=redisson_lock__channel:order  ARGV[1]=0/1 ARGV[2]=15(生存时间)  ARGV[3]=uid:thread1
+		unlock_lua: `
+		if (redis.call('exists', KEYS[1]) == 0) then 
+			redis.call('publish', KEYS[2], ARGV[1])
+			return 1
+		end
+		if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then 
+			return nil
+		end
+		local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1)
+		if (counter > 0 ) then
+			redis.call('pexpire', KEYS[1], ARGV[2])
+			return 0
+		else
+			redis.call('del', KEYS[1])
+			redis.call('publish', KEYS[2], ARGV[1])
+			return 1
+		end; 
+		return nil`,
 	}
 }
 
 // 尝试加锁函数
-func (lock *RedisLock) try_lock(key string, expire int) bool {
+func (lock *RedisLock) try_lock() bool {
 	lock_script := redis.NewScript(lock.lock_lua)
 	if lock_script == nil {
 		fmt.Println("lock_script :", lock_script)
 		return false
 	}
-	expire_time := strconv.Itoa(expire * 1000)
-	n, err := lock_script.Run(&lock.redisdb, []string{key}, []string{lock.uid, expire_time}).Result()
-	fmt.Println("lock result n:", n)
-	fmt.Println("lock result err:", err)
+	expire_time := strconv.Itoa(lock.expire_time * 1000)
+	result, err := lock_script.Run(&lock.redisdb, []string{lock.key}, []string{lock.uid, expire_time}).Result()
+	if result != nil {
+		fmt.Println("lock result error:", err)
+		return false
+	}
+	fmt.Println("lock result success:", err)
 	return true
 }
 
-//解锁函数
+// 外部调用加锁函数
+func (lock *RedisLock) Lock() {
+	for {
+		//尝试加锁
+		result_lock := lock.try_lock()
+		if result_lock {
+			fmt.Print("lock try_lock")
+			return
+		}
+		// 监听锁释放释放
+		pubsub := lock.redisdb.Subscribe(lock.subscribe_name)
+		for msg := range pubsub.Channel() {
+			fmt.Printf("channel=%s message=%s", msg.Channel, msg.Payload)
+			if msg.Payload == "0" {
+				break
+			}
+		}
+	}
+}
+
+// 释放锁
+func (lock *RedisLock) Unlock() {
+	unlock_script := redis.NewScript(lock.unlock_lua)
+	if unlock_script == nil {
+		fmt.Println("unlock_script :", unlock_script)
+		return
+	}
+	//order KEYS[2]=redisson_lock__channel:order  ARGV[1]=0/1 ARGV[2]=15(生存时间)  ARGV[3]=uid:thread1
+	expire_time := strconv.Itoa(lock.expire_time * 1000)
+	result, err := unlock_script.Run(&lock.redisdb, []string{lock.key, lock.subscribe_name}, []string{"1", expire_time, lock.uid}).Result()
+	if result != nil {
+		fmt.Println("unlock result: ", result, err)
+		return
+	}
+	fmt.Println("unlock result: ", result, err)
+}
+
+func (lock *RedisLock) ShowLockInfo() {
+	data, err := lock.redisdb.HGetAll(lock.key).Result()
+	fmt.Println("lock info: ", data, err)
+}
 
 func main() {
 	redis_client := redis.NewClient(&redis.Options{
@@ -67,13 +142,41 @@ func main() {
 		return
 	}
 
-	redis_lock1 := newRedisLock(*redis_client)
-	redis_lock2 := newRedisLock(*redis_client)
+	redis_lock1 := newRedisLock(*redis_client, "order", 30)
+	redis_lock2 := newRedisLock(*redis_client, "order", 30)
 
-	redis_lock1.try_lock("order", 15)
-	//fmt.Println("1111111122222")
-	redis_lock1.try_lock("order", 15)
-	//fmt.Println("11111111111")
-	redis_lock2.try_lock("order", 15)
+	redis_lock1.Lock()
+	fmt.Println("redis_lock1 lock 1 success")
+	redis_lock1.ShowLockInfo()
+
+	time.Sleep(time.Duration(10) * time.Second)
+	redis_lock1.Lock()
+	fmt.Println("redis_lock1 lock 2 success")
+	redis_lock1.ShowLockInfo()
+
+	redis_lock1.Unlock()
+	fmt.Println("redis_lock1 unlock 1 success")
+	redis_lock1.ShowLockInfo()
+
+	redis_lock1.Unlock()
+	fmt.Println("redis_lock1 unlock 2 success")
+	redis_lock1.ShowLockInfo()
+
+	redis_lock2.Lock()
+	fmt.Println("redis_lock2 lock success")
+	redis_lock2.ShowLockInfo()
+
+	redis_lock2.Unlock()
+	fmt.Println("redis_lock2 unlock success")
+	redis_lock2.ShowLockInfo()
+
+	// lock1 加锁不释放
+	// redis_lock1.Lock()
+	// fmt.Println("redis_lock1 lock 2 success")
+	// redis_lock1.ShowLockInfo()
+
+	// redis_lock2.Lock()
+	// fmt.Println("redis_lock1 lock 2 success")
+	// redis_lock1.ShowLockInfo()
 
 }
