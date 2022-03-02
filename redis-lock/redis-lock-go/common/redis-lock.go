@@ -21,7 +21,8 @@ type RedisLock struct {
 	// 加锁资源
 	key string
 	// 订阅频道名
-	subscribe_name string
+	subscribe_name        string
+	expire_subscribe_name string
 	// 加锁命令
 	lock_lua string
 	// 释放锁命令
@@ -31,11 +32,12 @@ type RedisLock struct {
 // 构造函数
 func newRedisLock(redisdb redis.Client, key string, expire int) *RedisLock {
 	return &RedisLock{
-		redisdb:        redisdb,
-		uid:            uuid.Must(uuid.NewV4()).String(),
-		expire_time:    expire,
-		key:            key,
-		subscribe_name: "redisson_lock__channel:" + key,
+		redisdb:               redisdb,
+		uid:                   uuid.Must(uuid.NewV4()).String(),
+		expire_time:           expire,
+		key:                   key,
+		subscribe_name:        "redisson_lock__channel:{" + key + "}",
+		expire_subscribe_name: "__keyevent@0" + "__:" + key,
 		lock_lua: `
 		if (redis.call('exists', KEYS[1]) == 0) then 
 			redis.call('hset', KEYS[1], ARGV[1], 1); 
@@ -71,20 +73,29 @@ func newRedisLock(redisdb redis.Client, key string, expire int) *RedisLock {
 	}
 }
 
+/*
+
+   String renewScript = "if redis.call('get',KEYS[1]) == ARGV[1] then \n" +
+           "     redis.call('pexpire', KEYS[1], ARGV[2]) \n" +
+           "     return 1 \n " +
+           " end \n" +
+           " return 0";
+*/
+
 // 尝试加锁函数
 func (lock *RedisLock) try_lock() bool {
 	lock_script := redis.NewScript(lock.lock_lua)
 	if lock_script == nil {
-		fmt.Println("lock_script :", lock_script)
+		fmt.Printf("lock_script : %s", lock_script)
 		return false
 	}
 	expire_time := strconv.Itoa(lock.expire_time * 1000)
 	result, err := lock_script.Run(&lock.redisdb, []string{lock.key}, []string{lock.uid, expire_time}).Result()
 	if result != nil {
-		fmt.Println("lock result error:", err)
+		fmt.Printf("########lock result error: %T", err)
 		return false
 	}
-	fmt.Println("lock result success:", err)
+	fmt.Printf("lock result success: %T", err)
 	return true
 }
 
@@ -92,8 +103,8 @@ func (lock *RedisLock) try_lock() bool {
 func (lock *RedisLock) Lock() {
 	for {
 		//尝试加锁
-		result_lock := lock.try_lock()
-		if result_lock {
+		ttl := lock.try_lock()
+		if ttl {
 			fmt.Print("lock try_lock")
 			return
 		}
@@ -133,7 +144,7 @@ func (lock *RedisLock) ShowLockInfo() {
 func main() {
 	redis_client := redis.NewClient(&redis.Options{
 		Addr:     "120.78.127.165:6379",
-		Password: "123456",
+		Password: "admin@password*123456",
 		DB:       0,
 	})
 	pong, err := redis_client.Ping().Result()
@@ -171,12 +182,12 @@ func main() {
 	redis_lock2.ShowLockInfo()
 
 	// lock1 加锁不释放
-	// redis_lock1.Lock()
-	// fmt.Println("redis_lock1 lock 2 success")
-	// redis_lock1.ShowLockInfo()
+	redis_lock1.Lock()
+	fmt.Println("redis_lock1 lock 2 success")
+	redis_lock1.ShowLockInfo()
 
-	// redis_lock2.Lock()
-	// fmt.Println("redis_lock1 lock 2 success")
-	// redis_lock1.ShowLockInfo()
+	redis_lock2.Lock()
+	fmt.Println("redis_lock1 lock 2 success")
+	redis_lock1.ShowLockInfo()
 
 }
